@@ -1,40 +1,62 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System;
 using System.IO;
 using System.Linq;
 using System.Net.WebSockets;
+using System.Security.Policy;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace websocket_playground
 {
-    public interface IWebSocket : IDisposable
+    public interface IWebSocket<TMessage> : IDisposable
     {
-        event EventHandler<string> OnMessage;
+        event EventHandler<TMessage> OnMessage;
 
-        Task ConnectAsync(Uri uri);
+        Task ConnectAsync();
         Task BeginReceiveAsync();
         Task SendAsync(string message);
     }
 
-    public class WebSocket : IWebSocket
+    public class WebSocket<TMessage> : IWebSocket<TMessage>
     {
-        public event EventHandler<string> OnMessage;
-        private readonly ClientWebSocket client;
+        public event EventHandler<TMessage> OnMessage;
+        private ClientWebSocket client;
+        private readonly Uri uri;
         private readonly CancellationTokenSource cancellationTokenSource;
         private readonly CancellationToken cancellationToken;
 
-        public WebSocket()
+        public WebSocket(Uri uri)
         {
+            this.uri = uri;
+
             client = new ClientWebSocket();
 
             cancellationTokenSource = new CancellationTokenSource();
             cancellationToken = cancellationTokenSource.Token;
         }
 
-        public Task ConnectAsync(Uri uri)
+        public async Task ConnectAsync()
         {
-            return client.ConnectAsync(uri, cancellationToken);
+            try
+            {
+                await client.ConnectAsync(uri, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Exception while connecting. " +
+                                  $"Waiting 2 sec before next reconnection try. Error: '{e.Message}'");
+                await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
+                await ReconnectAsync().ConfigureAwait(false);
+            }
+        }
+
+        private async Task ReconnectAsync()
+        {
+            client = new ClientWebSocket();
+            await ConnectAsync().ConfigureAwait(false);
         }
 
         public Task BeginReceiveAsync()
@@ -43,15 +65,21 @@ namespace websocket_playground
             {
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    string message = await ReceiveAsync().ConfigureAwait(false);
-                    OnMessage?.Invoke(this, message);
+                    try
+                    {
+                        await ReceiveAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Exception: {ex.Message}");
+                    }
                 }
             }, cancellationToken);
 
             return Task.CompletedTask;
         }
 
-        private async Task<string> ReceiveAsync()
+        private async Task ReceiveAsync()
         {
             const int chunkSize = 1024 * 4;
             ArraySegment<byte> buffer = new ArraySegment<byte>(new byte[chunkSize]);
@@ -62,50 +90,60 @@ namespace websocket_playground
             MemoryStream ms = null;
             bool endOfMessage = false;
 
-            while (!endOfMessage)
+            try
             {
-                WebSocketReceiveResult result = await client.ReceiveAsync(buffer, cancellationToken).ConfigureAwait(false);
-
-                byte[] currentChunk = buffer.Array;
-                int currentChunkSize = result.Count;
-
-                bool isFirstChunk = resultArrayWithTrailing == null;
-                if (isFirstChunk)
+                while (!endOfMessage)
                 {
-                    resultArraySize += currentChunkSize;
-                    resultArrayWithTrailing = currentChunk;
-                    isResultArrayCloned = false;
-                }
-                else
-                {
-                    if (ms == null)
+                    WebSocketReceiveResult result = await client.ReceiveAsync(buffer, cancellationToken).ConfigureAwait(false);
+
+                    byte[] currentChunk = buffer.Array;
+                    int currentChunkSize = result.Count;
+
+                    bool isFirstChunk = resultArrayWithTrailing == null;
+                    if (isFirstChunk)
                     {
-                        ms = new MemoryStream();
-                        ms.Write(resultArrayWithTrailing, 0, resultArraySize);
+                        resultArraySize += currentChunkSize;
+                        resultArrayWithTrailing = currentChunk;
+                        isResultArrayCloned = false;
+                    }
+                    else
+                    {
+                        if (ms == null)
+                        {
+                            ms = new MemoryStream();
+                            ms.Write(resultArrayWithTrailing, 0, resultArraySize);
+                        }
+
+                        if (currentChunk != null)
+                        {
+                            ms.Write(currentChunk, buffer.Offset, currentChunkSize);
+                        }
                     }
 
-                    if (currentChunk != null)
+                    Console.WriteLine($"Message type {result.MessageType}");
+
+                    endOfMessage = result.EndOfMessage;
+
+                    if (!isResultArrayCloned)
                     {
-                        ms.Write(currentChunk, buffer.Offset, currentChunkSize);
+                        resultArrayWithTrailing = resultArrayWithTrailing?.ToArray();
+                        isResultArrayCloned = true;
                     }
                 }
 
-                endOfMessage = result.EndOfMessage;
+                string message = ms != null ?
+                    Encoding.UTF8.GetString(ms.ToArray()) :
+                    resultArrayWithTrailing != null ?
+                        Encoding.UTF8.GetString(resultArrayWithTrailing, 0, resultArraySize) :
+                        null;
 
-                if (!isResultArrayCloned)
-                {
-                    resultArrayWithTrailing = resultArrayWithTrailing?.ToArray();
-                    isResultArrayCloned = true;
-                }
+                OnMessage?.Invoke(this, JsonConvert.DeserializeObject<TMessage>(message));
             }
-
-            string message = ms != null ?
-                Encoding.UTF8.GetString(ms.ToArray()) :
-                resultArrayWithTrailing != null ?
-                    Encoding.UTF8.GetString(resultArrayWithTrailing, 0, resultArraySize) :
-                    null;
-
-            return message;
+            catch (Exception)
+            {
+                client?.Dispose();
+                await ReconnectAsync().ConfigureAwait(false);
+            }
         }
 
         public Task SendAsync(string message)
@@ -125,52 +163,35 @@ namespace websocket_playground
 
     internal class Program
     {
-        private static IWebSocket provisioningWebSocket;
-        private static IWebSocket agentVersionWebSocket;
-        // 1. BeginReceiveAsync
-        // 2. SendAsync
+        private static IWebSocket<string[]> adapterWebSocket;
 
         public static async Task Main()
         {
-            provisioningWebSocket = new WebSocket();
-            await provisioningWebSocket.ConnectAsync(new Uri("ws://127.0.0.1:5002/provisioning")).ConfigureAwait(false);
-
-            agentVersionWebSocket = new WebSocket();
-            await agentVersionWebSocket.ConnectAsync(new Uri("ws://127.0.0.1:5002/agentVersion")).ConfigureAwait(false);
+            adapterWebSocket = new WebSocket<string[]>(new Uri("ws://127.0.0.1:5002"));
+            await adapterWebSocket.ConnectAsync();
 
             try
             {
-                await BeginReceiveAsync(provisioningWebSocket, OnProvisioning).ConfigureAwait(false);
-                await BeginReceiveAsync(agentVersionWebSocket, OnAgentVersion).ConfigureAwait(false);
+                adapterWebSocket.OnMessage += OnProvisioning;
 
-                await provisioningWebSocket.SendAsync("Provisioning data from client.");
-                await agentVersionWebSocket.SendAsync("Agent version data from client.");
+                _ = adapterWebSocket.BeginReceiveAsync();
+
+                //_ = adapterWebSocket.SendAsync("Provisioning data from client.");
 
                 Console.ReadKey();
             }
             finally
             {
-                provisioningWebSocket?.Dispose();
-                agentVersionWebSocket?.Dispose();
+                adapterWebSocket?.Dispose();
+
+                Console.WriteLine("Done");
             }
 
         }
 
-        private static async Task BeginReceiveAsync(IWebSocket webSocket, EventHandler<string> onNewMessage)
+        private static void OnProvisioning(object sender, string[] e)
         {
-            webSocket.OnMessage += onNewMessage;
-
-            await webSocket.BeginReceiveAsync().ConfigureAwait(false);
-        }
-
-        private static void OnProvisioning(object sender, string e)
-        {
-            Console.WriteLine($"Provisioning received: {e}");
-        }
-
-        private static void OnAgentVersion(object sender, string e)
-        {
-            Console.WriteLine($"Agent version received: {e}");
+            Console.WriteLine($"Provisioning received: {string.Join(", ", e)}");
         }
     }
 }
